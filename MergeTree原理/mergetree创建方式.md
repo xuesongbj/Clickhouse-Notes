@@ -1,0 +1,38 @@
+# MergeTree创建方式
+
+MergeTree在写入一批数据时，数据总会以数据片段的形式写入磁盘，且数据片段不可修改。为了避免片段过多，ClickHouse通过后台线程，定期合并这些数据片段，属于相同分区的数据片段会被合并一个新的片段。
+
+&nbsp;
+
+## 创建MergeTree表
+
+```SQL
+CREATE TABLE [IF NOT EXISTS] [db.]table_name [ON CLUSTER cluster]
+(
+    name1 [type1] [DEFAULT|MATERIALIZED|ALIAS expr1] [TTL expr1],
+    name2 [type2] [DEFAULT|MATERIALIZED|ALIAS expr2] [TTL expr2],
+    ...
+    INDEX index_name1 expr1 TYPE type1(...) GRANULARITY value1,
+    INDEX index_name2 expr2 TYPE type2(...) GRANULARITY value2,
+    ...
+    PROJECTION projection_name_1 (SELECT <COLUMN LIST EXPR> [GROUP BY] [ORDER BY]),
+    PROJECTION projection_name_2 (SELECT <COLUMN LIST EXPR> [GROUP BY] [ORDER BY])
+) ENGINE = MergeTree()
+ORDER BY expr
+[PARTITION BY expr]
+[PRIMARY KEY expr]
+[SAMPLE BY expr]
+[TTL expr
+    [DELETE|TO DISK 'xxx'|TO VOLUME 'xxx' [, ...] ]
+    [WHERE conditions]
+    [GROUP BY key_expr [SET v1 = aggr_func(v1) [, v2 = aggr_func(v2) ...]] ] ]
+[SETTINGS name=value, ...]
+```
+
+* `[PARTITION BY expr]`：分区键，用于指定表数据使用什么标准进行分区。分区键可以是单个列字段；也可以通过元组使用多个列字段，同时也支持表达式；**如果不设置分区，则默认生成一个名为`all`的分区。**。合理使用分区可以有效减少数据文件扫描范围，提升查询性能。
+
+* `ORDER BY expr`：排序键，数据表采用什么标准进行排序。**默认主键(PRIMARY KEY)与排序键相同**。排序键可以是单个列字段，也可以是多个列字段(`ORDER BY (CounterID, EventDate)`)。在使用多个列字段排序时，首先会以元组第一个元素进行排序，如果第一个元素相同，再按第二个、第三个...进行排序。
+
+* `[PRIMARY KEY expr]`：主键，声明后会依照主键字段生成一级索引，用于加速表查询。默认情况下，主键与排序键(`ORDER BY`)相同，所以通常直接使用 `ORDER BY` 代为指定主键，**无须可以通过 `PRIMARY KEY` 声明**。在一般情况下，在单个数据片段内，数据与一级索引以相同的规则升序排列。与其他数据库不同，MergeTree主键允许存在重复数据(`ReplacingMergeTree`可以去重)。
+
+* `SAMPLE BY [选项]`：抽样表达式，用于声明数据以何种标准进行采样。`SAMPLE BY  intHash32(UserID)`。抽样表达式需要配合 `SAMPLE` 自查询使用，这项功能对于选取抽样数据十分有用。
