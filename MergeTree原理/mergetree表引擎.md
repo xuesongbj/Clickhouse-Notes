@@ -140,3 +140,58 @@ optimize TABLE table_name FINAL
 ```SQL
 SYSTEM STOP/START TTL MERGES
 ```
+
+&nbsp;
+
+## 多路径存储
+
+Clickhouse 19.15 版本之前，MergeTree表引擎只支持单路径存储，所有数据都被写入到 `config.xml` 配置中 `path` 指定的路径下，即时服务器挂载了多块磁盘，也无法有效利用这些存储空间。为解决该问题，从 `19.15` 版本开始，MergeTree表引擎实现了自定义存储策略的功能，支持以数据分区为最小移动单位，将分区目录写入多块磁盘目录。
+
+目前大致支持三大类存储策略。
+
+* 默认策略：MergeTree表默认策略，根据该策略会将数据自动保存到 `config.xml` 配置中 `path` 指定的路径下。
+
+* `JBOD`策略：`Just a Bunch of Disks` 策略，适合服务器挂载了多块磁盘，但没有做RAID的场景。它是一种轮询策略，每执行一次 `INSERT` 或者 `MERGE`，所产生的新分区会轮询写入各个磁盘，可以降低单块磁盘的负载，在一定条件下能够增加数据并行读写的性能。如果单块磁盘发生故障，则会丢掉该块磁盘数据(数据的可靠性需要利用副本机制保障)。
+
+* `HOT/COLD` 策略：这从策略适合服务器挂载了不同类型磁盘的场景。可以将磁盘分为 `HOT` 与 `COLD` 两类分区。**`HOT`分区使用SSD这类高性能磁盘，注重存取新能；`COLD` 区域则使用HDD这类大容量磁盘。** 数据在写入 `MergeTree` 之初，首先会在 `HOT` 区域创建分区目录用于保存数据，当分区数据大小积累到阈值时，数据会自行移动到 `COLD` 区域。在每个区域的内容，也支持定义多个磁盘，所以在单个区域的写入过程中，也能应用 `JBOD` 策略。
+
+&nbsp;
+
+### JBOD策略
+
+JBOD策略，每当生成一个新数据分区的时候，分区目录会根据 `volume` 中定义的 `disk` 顺序一次轮询并写入各个磁盘。
+
+```xml
+<!-- 定义多路径存储策略 -->
+<storage_configuration>
+    <!-- 定义磁盘 -->
+    <disks>
+        <disk_01>   <!-- 自定义磁盘名称，全局唯一 -->
+            <path>/data/chbase/data_01/</path>  <!-- 磁盘路径 -->
+        </disk_01>
+        <disk_02>
+            <path>/data/chbase/data_02/</path>
+        </disk_02>
+        <disk_03>
+            <path>/data/chbase/data_03/</path>
+        </disk_03>
+    </disks>
+
+    <!-- 定义策略 -->
+    <policies>
+        <jbod_policies> <!-- 自定义策略全局唯一 -->
+            <!-- 定义volume -->
+            <volumes>
+                <jbod_volume>  <!-- 自定义volume名称，全局唯一 -->
+                   <disk>disk_01</disk> <!-- 指定该volume 下使用的磁盘，磁盘名称和上面定义的对应 -->
+                   <disk>disk_02</disk>
+                </jbod_volume>
+            </volumes>
+        </jbod_policies>
+    </policies>
+</storage_configuration>
+```
+
+* `keep_free_space_bytes`：用于指定指定磁盘的预留空间。
+* `max_data_part_size_bytes`：用于在这个卷的单个disk磁盘中，一个数据分区的最大磁盘存储阈值，若当前分区的数据大小超过阈值，则之后的分区会写入下一个disk磁盘。
+* `move_factor`：若当前卷的可用空间大小小于factor因子，并且定义多个卷，则数据会自动移动到下一个卷。
