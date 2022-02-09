@@ -195,3 +195,249 @@ JBOD策略，每当生成一个新数据分区的时候，分区目录会根据 
 * `keep_free_space_bytes`：用于指定指定磁盘的预留空间。
 * `max_data_part_size_bytes`：用于在这个卷的单个disk磁盘中，一个数据分区的最大磁盘存储阈值，若当前分区的数据大小超过阈值，则之后的分区会写入下一个disk磁盘。
 * `move_factor`：若当前卷的可用空间大小小于factor因子，并且定义多个卷，则数据会自动移动到下一个卷。
+
+#### 实例
+
+&nbsp;
+
+##### 配置
+
+```xml
+<storage_configuration>
+    <disks>
+        <disk_01>
+            <path>/data/chbase/data_01/</path>
+        </disk_01>
+        <disk_02>
+            <path>/data/chbase/data_02/</path>
+        </disk_02>
+        <disk_03>
+            <path>/data/chbase/data_03/</path>
+        </disk_03>
+    </disks>
+    <policies>
+        <jbod_policies>
+            <volumes>
+                <jbod_volume>
+                   <disk>disk_01</disk>
+                   <disk>disk_02</disk>
+                </jbod_volume>
+            </volumes>
+        </jbod_policies>
+    </policies>
+</storage_configuration>
+```
+
+&nbsp;
+
+##### 查看配置
+
+```sql
+localhost :) SELECT name, path, formatReadableSize(free_space) AS free, formatReadableSize(total_space) AS total, formatReadableSize(keep_free_space) AS reserved FROM system.disks;
+
+┌─name────┬─path────────────────────────────┬─free──────┬─total─────┬─reserved─┐
+│ default │ /data/database/clickhouse/data/ │ 13.19 GiB │ 29.98 GiB │ 0.00 B   │
+│ disk_01 │ /data/chbase/data_01/           │ 13.19 GiB │ 29.98 GiB │ 0.00 B   │
+│ disk_02 │ /data/chbase/data_02/           │ 13.19 GiB │ 29.98 GiB │ 0.00 B   │
+│ disk_03 │ /data/chbase/data_03/           │ 13.19 GiB │ 29.98 GiB │ 0.00 B   │
+└─────────┴─────────────────────────────────┴───────────┴───────────┴──────────┘
+```
+
+&nbsp;
+
+##### 查看polices策略
+
+```SQL
+localhost :) SELECT policy_name, volume_name, volume_priority, disks, formatReadableSize(max_data_part_size) AS max_data_part_size, move_factor FROM system.storage_policies;
+
+┌─policy_name───┬─volume_name─┬─volume_priority─┬─disks─────────────────┬─max_data_part_size─┬─move_factor─┐
+│ default       │ default     │               1 │ ['default']           │ 0.00 B             │           0 │
+│ jbod_policies │ jbod_volume │               1 │ ['disk_01','disk_02'] │ 0.00 B             │         0.1 │
+└───────────────┴─────────────┴─────────────────┴───────────────────────┴────────────────────┴─────────────┘
+```
+
+##### 建表测试
+
+```SQL
+##使用settings storage_policy='jbod_policies'指定策略
+localhost :) CREATE TABLE jbod_table_v1
+(
+    `id` UInt64
+)
+ENGINE = MergeTree()
+ORDER BY id
+SETTINGS storage_policy = 'jbod_policies'
+
+##写入第一批数据，创建第一个分区目录
+localhost :) INSERT INTO jbod_table_v1 SELECT rand() FROM numbers(10);
+
+##查看系统分区表，可以看到第一个分区all_1_1_0被写入到disk_01
+localhost :) SELECT name, disk_name FROM system.parts WHERE table='jbod_table_v1';
+┌─name──────┬─disk_name─┐
+│ all_1_1_0 │ disk_01   │
+└───────────┴───────────┘
+
+##写入第二批数据，创建第二个分区目录
+localhost :) INSERT INTO jbod_table_v1 SELECT rand() FROM numbers(10);
+
+##可以看到第二个分区all_2_2_0被写入到disk_02 
+localhost :) SELECT name, disk_name FROM system.parts WHERE table='jbod_table_v1';
+┌─name──────┬─disk_name─┐
+│ all_1_1_0 │ disk_01   │
+│ all_2_2_0 │ disk_02   │
+└───────────┴───────────┘
+
+##反复几次
+localhost :) SELECT name, disk_name FROM system.parts WHERE table='jbod_table_v1';
+┌─name──────┬─disk_name─┐
+│ all_1_1_0 │ disk_01   │
+│ all_2_2_0 │ disk_02   │
+│ all_3_3_0 │ disk_01   │
+│ all_4_4_0 │ disk_02   │
+└───────────┴───────────┘
+```
+
+`JBOD`策略，每当生成一个新数据分区的时候，分区目录会根据`volume`中定义的`disk`顺序依次轮询并写入各个`disk`。
+
+&nbsp;
+
+### HOT/COLD
+
+&nbsp;
+
+#### 具体配置
+
+```xml
+<storage_configuration>
+    <disks>
+        <disk_01>
+            <path>/data/chbase/data_01/</path>
+        </disk_01>
+        <disk_02>
+            <path>/data/chbase/data_02/</path>
+        </disk_02>
+        <clod_disk>
+            <path>/data/chbase/cold_data/</path>
+            <keep_free_space_bytes>21474836480</keep_free_space_bytes>
+        </clod_disk>
+    </disks>
+    <policies>
+        <hot_to_cold>
+            <volumes>
+                <hot_volume>
+                   <disk>disk_01</disk>
+                   <disk>disk_02</disk>
+                   <max_data_part_size_bytes>1048576</max_data_part_size_bytes>
+                </hot_volume>
+                <cold_volume>
+                    <disk>clod_disk</disk>
+                </cold_volume>
+            </volumes>
+            <move_factor>0.2</move_factor>
+        </hot_to_cold>
+    </policies>
+</storage_configuration>
+```
+
+&nbsp;
+
+##### 查看disk配置
+
+```SQL
+localhost :) SELECT name, path, formatReadableSize(free_space) AS free, formatReadableSize(total_space) AS total, formatReadableSize(keep_free_space) AS reserved FROM system.disks;
+
+┌─name──────┬─path────────────────────────────┬─free──────┬─total─────┬─reserved──┐
+│ clod_disk │ /data/chbase/cold_data/         │ 29.94 GiB │ 29.97 GiB │ 20.00 GiB │
+│ default   │ /data/database/clickhouse/data/ │ 16.49 GiB │ 27.94 GiB │ 0.00 B    │
+│ disk_01   │ /data/chbase/data_01/           │ 9.96 GiB  │ 9.99 GiB  │ 0.00 B    │
+│ disk_02   │ /data/chbase/data_02/           │ 9.96 GiB  │ 9.99 GiB  │ 0.00 B    │
+└───────────┴─────────────────────────────────┴───────────┴───────────┴───────────┘
+```
+
+&nbsp;
+
+##### 查看polices策略
+
+```SQL
+localhost :) SELECT policy_name, volume_name, volume_priority, disks, formatReadableSize(max_data_part_size) AS max_data_part_size, move_factor FROM system.storage_policies;
+
+┌─policy_name─┬─volume_name──┬─volume_priority─┬─disks─────────────────┬─max_data_part_size─┬─move_factor─┐
+│ default     │ default      │               1 │ ['default']           │ 0.00 B             │           0 │
+│ hot_to_cold │ hot_volume   │               1 │ ['disk_01','disk_02'] │ 1.00 GiB           │         0.2 │
+│ hot_to_cold │ cold_volume  │               2 │ ['clod_disk']         │ 0.00 B             │         0.2 │
+└─────────────┴──────────────┴─────────────────┴───────────────────────┴────────────────────┴─────────────┘
+```
+
+可以看出， `hot_to_cold` 策略有两个`volume`：`hot_volume`、`cold_volume`。其中 `hot_volume` 有两块磁盘：`disk_01`、`disk_02`。
+
+&nbsp;
+
+##### 建表测试
+
+```SQL
+localhost : CREATE TABLE htc_table_1
+(
+    `id` UInt64
+)
+ENGINE = MergeTree()
+ORDER BY id
+SETTINGS storage_policy = 'hot_to_cold';
+
+##写入两个分区
+localhost :) INSERT INTO htc_table_1 SELECT rand() FROM numbers(100000);
+
+##查看两次生成的分区采用JBOD策略均衡在disk_01、disk_02
+localhost :) SELECT name, disk_name FROM system.parts WHERE table='htc_table_1';
+
+┌─name──────┬─disk_name─┐
+│ all_1_1_0 │ disk_01   │
+│ all_2_2_0 │ disk_02   │
+└───────────┴───────────┘
+
+##由于max_data_part_size_bytes配置是1M，写入一个超过1M大小的分区
+localhost :) INSERT INTO htc_table_1 SELECT rand() FROM numbers(300000);
+
+##可以看到第三个分区被写入到clod_disk
+localhost :) SELECT name, disk_name FROM system.parts WHERE table='htc_table_1';
+
+┌─name──────┬─disk_name─┐
+│ all_1_1_0 │ disk_01   │
+│ all_2_2_0 │ disk_02   │
+│ all_3_3_0 │ clod_disk │
+└───────────┴───────────┘
+```
+
+`HOT/COLD`策略，由多个`disk`组成`volume`组。每当一个新数据分区生成的时候，按照阈值(`max_data_part_size_bytes`)的大小，分区目录会按照`volume`组中定义的顺序依次写入。
+
+合并分区或者一次性写入的分区大小超过`max_data_part_size_bytes`，也会被写入到`COLD`卷中。
+
+&nbsp;
+
+## 分区移动
+
+虽然`MergeTree`定义完存储策略后不能修改，但却可以移动分区。
+
+```SQL
+## 将某个分区移动到当前volume的另一个disk
+localhost :) ALTER TABLE htc_table_1 MOVE PART 'all_1_1_0' TO DISK 'disk_02';
+
+localhost :) SELECT name, disk_name FROM system.parts WHERE table='htc_table_1';
+
+┌─name──────┬─disk_name─┐
+│ all_1_1_0 │ disk_02   │
+│ all_2_2_0 │ disk_02   │
+│ all_3_3_0 │ clod_disk │
+└───────────┴───────────┘
+
+
+##将某个分区移动到其他volume
+localhost :) ALTER TABLE htc_table_1 MOVE PART 'all_1_1_0' TO VOLUME 'cold_volume';
+
+localhost :) SELECT name, disk_name FROM system.parts WHERE table='htc_table_1';
+
+┌─name──────┬─disk_name─┐
+│ all_1_1_0 │ clod_disk │
+│ all_2_2_0 │ disk_02   │
+│ all_3_3_0 │ clod_disk │
+└───────────┴───────────┘
+```
